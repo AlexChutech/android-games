@@ -17,6 +17,12 @@
 - 上一步橙色标记
 - 支持悔棋
 
+## 截图
+
+| 五子棋 | 中国象棋 |
+|:---:|:---:|
+| ![五子棋](screenshots/gomoku.png) | ![中国象棋](screenshots/xiangqi.png) |
+
 ## 技术栈
 - Kotlin
 - Android SDK 34
@@ -30,10 +36,6 @@
 # 或使用 Gradle 命令行
 ./gradlew assembleDebug
 ```
-
-## 截图
-
-游戏运行在 Android 模拟器上的效果良好。
 
 ---
 
