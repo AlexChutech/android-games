@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="board_bg">#F4D58D</color>
+    <color name="line_color">#8B4513</color>
+    <color name="red_piece">#C41E3A</color>
+    <color name="black_piece">#1A1A1A</color>
+    <color name="primary">#8B4513</color>
+    <color name="primary_dark">#5D3A1A</color>
+</resources>
