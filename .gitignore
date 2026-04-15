@@ -13,9 +13,6 @@
 .DS_Store
 Thumbs.db
 
-# APK (too large)
-**/*.apk
-
 # Temp
 *.tmp
 *.temp
