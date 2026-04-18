@@ -2,14 +2,20 @@ package com.xiangqi.app
 
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.random.Random
 
 class AIEngine {
 
     companion object {
-        private const val MAX_DEPTH = 6
+        private const val MAX_DEPTH = 8
         private const val INFINITY = 10000000
+        private const val NULL_MOVE_REDUCTION = 2
 
-        // More accurate piece values
+        // TT flags
+        private const val TT_EXACT = 0
+        private const val TT_LOWER = 1
+        private const val TT_UPPER = 2
+
         private val PIECE_VALUES = mapOf(
             XiangqiEngine.R_KING to 10000, XiangqiEngine.B_KING to 10000,
             XiangqiEngine.R_ADVISOR to 20, XiangqiEngine.B_ADVISOR to 20,
@@ -20,7 +26,6 @@ class AIEngine {
             XiangqiEngine.R_PAWN to 10, XiangqiEngine.B_PAWN to 10
         )
 
-        // Advanced position tables
         private val KING_POS = arrayOf(
             intArrayOf(0, 0, 0, -10, 0, -10, 0, 0, 0),
             intArrayOf(0, 0, 0, 0, 5, 0, 0, 0, 0),
@@ -60,7 +65,6 @@ class AIEngine {
             intArrayOf(0, 0, 0, 0, 0, 0, 0, 0, 0)
         )
 
-        // Knight loves center and enemy territory
         private val KNIGHT_POS = arrayOf(
             intArrayOf(0, -2, 4, 4, 2, 4, 4, -2, 0),
             intArrayOf(0, 4, 8, 8, 4, 8, 8, 4, 0),
@@ -74,7 +78,6 @@ class AIEngine {
             intArrayOf(0, -2, 4, 4, 2, 4, 4, -2, 0)
         )
 
-        // Rook loves open files and 7th rank
         private val ROOK_POS = arrayOf(
             intArrayOf(6, 8, 8, 10, 12, 10, 8, 8, 6),
             intArrayOf(8, 12, 12, 14, 16, 14, 12, 12, 8),
@@ -88,7 +91,6 @@ class AIEngine {
             intArrayOf(6, 8, 8, 10, 12, 10, 8, 8, 6)
         )
 
-        // Cannon: likes to stay back for attacks
         private val CANNON_POS = arrayOf(
             intArrayOf(0, 0, 2, 4, 4, 4, 2, 0, 0),
             intArrayOf(0, 2, 4, 6, 6, 6, 4, 2, 0),
@@ -102,7 +104,6 @@ class AIEngine {
             intArrayOf(0, 0, 2, 4, 4, 4, 2, 0, 0)
         )
 
-        // Pawn: more valuable after crossing river
         private val PAWN_POS = arrayOf(
             intArrayOf(0, 0, 0, 12, 16, 12, 0, 0, 0),
             intArrayOf(0, 0, 0, 10, 14, 10, 0, 0, 0),
@@ -115,27 +116,76 @@ class AIEngine {
             intArrayOf(0, 0, 0, 10, 14, 10, 0, 0, 0),
             intArrayOf(0, 0, 0, 12, 16, 12, 0, 0, 0)
         )
+
+        // Opening book: common good opening moves for Black
+        private val OPENING_BOOK = mapOf(
+            // First move options
+            "start" to listOf(
+                Move(0, 1, 2, 2),  // 炮二平五 (Cannon to center)
+                Move(0, 7, 2, 6),  // 炮八平五
+                Move(0, 1, 2, 0),  // 马二进三
+                Move(0, 7, 2, 8)   // 马八进九
+            )
+        )
     }
 
+    // Zobrist hashing
+    private val zobristTable = Array(XiangqiEngine.ROWS) {
+        Array(XiangqiEngine.COLS) { LongArray(15) }
+    }
+
+    init {
+        val random = Random(12345)
+        for (r in 0 until XiangqiEngine.ROWS) {
+            for (c in 0 until XiangqiEngine.COLS) {
+                for (p in 0..14) {
+                    zobristTable[r][c][p] = random.nextLong()
+                }
+            }
+        }
+    }
+
+    data class TTEntry(
+        val hash: Long,
+        val depth: Int,
+        val score: Int,
+        val bestMove: Move?,
+        val flag: Int
+    )
+
+    private val transpositionTable = mutableMapOf<Long, TTEntry>()
     private var nodesEvaluated = 0
+    private var ttHits = 0
     private val killerMoves = Array(MAX_DEPTH + 1) { mutableMapOf<Int, Int>() }
     private val historyTable = mutableMapOf<Int, Int>()
     private var bestMoveAtRoot: Move? = null
 
     fun getBestMove(engine: XiangqiEngine): Move? {
         nodesEvaluated = 0
+        ttHits = 0
         killerMoves.forEach { it.clear() }
         historyTable.clear()
         bestMoveAtRoot = null
+        transpositionTable.clear()
 
         val moves = engine.getAllValidMoves(false)
         if (moves.isEmpty()) return null
 
+        // Opening book
+        val pieceCount = countPieces(engine)
+        if (pieceCount == 32) {  // First move
+            val openingMoves = OPENING_BOOK["start"]
+            if (openingMoves != null && openingMoves.isNotEmpty()) {
+                return openingMoves.random()
+            }
+        }
+
         // Iterative deepening
         var bestMove = moves[0]
+        val hash = computeHash(engine)
 
         for (depth in 1..MAX_DEPTH) {
-            val result = searchRoot(engine, moves, depth)
+            val result = searchRoot(engine, moves, depth, hash)
             if (result != null) {
                 bestMove = result
                 bestMoveAtRoot = result
@@ -145,18 +195,21 @@ class AIEngine {
         return bestMove
     }
 
-    private fun searchRoot(engine: XiangqiEngine, moves: List<Move>, depth: Int): Move? {
+    private fun searchRoot(engine: XiangqiEngine, moves: List<Move>, depth: Int, hash: Long): Move? {
         var bestMove: Move? = bestMoveAtRoot
         var bestScore = -INFINITY
         var alpha = -INFINITY
         val beta = INFINITY
 
-        // Sort moves with multiple heuristics
-        val sortedMoves = sortMoves(engine, moves, depth, true)
+        val ttEntry = transpositionTable[hash]
+        val pvMove = ttEntry?.bestMove
+
+        val sortedMoves = sortMovesWithPV(engine, moves, depth, pvMove)
 
         for (move in sortedMoves) {
             val captured = engine.board[move.toRow][move.toCol]
             val piece = engine.board[move.fromRow][move.fromCol]
+            val newHash = updateHash(hash, move, piece, captured)
 
             engine.board[move.toRow][move.toCol] = piece
             engine.board[move.fromRow][move.fromCol] = XiangqiEngine.EMPTY
@@ -164,7 +217,7 @@ class AIEngine {
             val score = if (captured == XiangqiEngine.R_KING) {
                 INFINITY
             } else {
-                -alphaBeta(engine, depth - 1, -beta, -alpha, false)
+                -alphaBeta(engine, depth - 1, -beta, -alpha, false, newHash, false)
             }
 
             engine.board[move.fromRow][move.fromCol] = piece
@@ -177,20 +230,51 @@ class AIEngine {
             alpha = max(alpha, score)
         }
 
-        // Update history table
-        if (bestMove != null && bestScore > -INFINITY / 2) {
+        if (bestMove != null) {
             val moveKey = getMoveKey(bestMove)
             historyTable[moveKey] = (historyTable[moveKey] ?: 0) + depth * depth
         }
 
+        transpositionTable[hash] = TTEntry(hash, depth, bestScore, bestMove, TT_EXACT)
+
         return bestMove
     }
 
-    private fun alphaBeta(engine: XiangqiEngine, depth: Int, alpha: Int, beta: Int, isMaximizing: Boolean): Int {
+    private fun alphaBeta(
+        engine: XiangqiEngine,
+        depth: Int,
+        alpha: Int,
+        beta: Int,
+        isMaximizing: Boolean,
+        hash: Long,
+        nullMoveUsed: Boolean
+    ): Int {
         nodesEvaluated++
+
+        // TT lookup
+        val ttEntry = transpositionTable[hash]
+        if (ttEntry != null && ttEntry.depth >= depth) {
+            ttHits++
+            when (ttEntry.flag) {
+                TT_EXACT -> return ttEntry.score
+                TT_LOWER -> if (ttEntry.score >= beta) return ttEntry.score
+                TT_UPPER -> if (ttEntry.score <= alpha) return ttEntry.score
+            }
+        }
 
         if (depth <= 0) {
             return quiescenceSearch(engine, alpha, beta, isMaximizing, 4)
+        }
+
+        // Null move pruning
+        if (!nullMoveUsed && depth >= 3 && !engine.isInCheck(isMaximizing)) {
+            val material = countMaterial(engine)
+            if (material > 1000) {  // Not in endgame
+                val nullScore = -alphaBeta(engine, depth - 1 - NULL_MOVE_REDUCTION, -beta, -beta + 1, !isMaximizing, hash, true)
+                if (nullScore >= beta) {
+                    return beta
+                }
+            }
         }
 
         val moves = engine.getAllValidMoves(isMaximizing)
@@ -204,37 +288,46 @@ class AIEngine {
         }
 
         var a = alpha
-        val sortedMoves = sortMoves(engine, moves, depth, isMaximizing)
+        var bestMove: Move? = null
+        val pvMove = ttEntry?.bestMove
+
+        val sortedMoves = sortMovesWithPV(engine, moves, depth, pvMove)
 
         for (move in sortedMoves) {
             val captured = engine.board[move.toRow][move.toCol]
             val piece = engine.board[move.fromRow][move.fromCol]
+            val newHash = updateHash(hash, move, piece, captured)
 
             engine.board[move.toRow][move.toCol] = piece
             engine.board[move.fromRow][move.fromCol] = XiangqiEngine.EMPTY
 
-            val score = -alphaBeta(engine, depth - 1, -beta, -a, !isMaximizing)
+            val score = -alphaBeta(engine, depth - 1, -beta, -a, !isMaximizing, newHash, false)
 
             engine.board[move.fromRow][move.fromCol] = piece
             engine.board[move.toRow][move.toCol] = captured
 
+            if (score > a) {
+                a = score
+                bestMove = move
+            }
+
             if (score >= beta) {
-                // Killer move
                 val depthIdx = minOf(depth, MAX_DEPTH)
                 val moveKey = getMoveKey(move)
                 killerMoves[depthIdx][moveKey] = (killerMoves[depthIdx][moveKey] ?: 0) + depth
+
+                val flag = TT_LOWER
+                transpositionTable[hash] = TTEntry(hash, depth, score, bestMove, flag)
                 return score
             }
-
-            if (score > a) {
-                a = score
-            }
         }
+
+        val flag = if (a > alpha) TT_EXACT else TT_UPPER
+        transpositionTable[hash] = TTEntry(hash, depth, a, bestMove, flag)
 
         return a
     }
 
-    // Quiescence search to avoid horizon effect
     private fun quiescenceSearch(engine: XiangqiEngine, alpha: Int, beta: Int, isMaximizing: Boolean, depth: Int): Int {
         val standPat = evaluateBoard(engine, isMaximizing)
 
@@ -248,7 +341,6 @@ class AIEngine {
             if (standPat < beta) return standPat
         }
 
-        // Only search captures
         val moves = engine.getAllValidMoves(isMaximizing).filter { move ->
             engine.board[move.toRow][move.toCol] != XiangqiEngine.EMPTY
         }
@@ -286,43 +378,82 @@ class AIEngine {
         return if (isMaximizing) a else b
     }
 
-    private fun sortMoves(engine: XiangqiEngine, moves: List<Move>, depth: Int, isMaximizing: Boolean): List<Move> {
+    private fun sortMovesWithPV(engine: XiangqiEngine, moves: List<Move>, depth: Int, pvMove: Move?): List<Move> {
         return moves.map { move ->
             var score = 0
 
-            // MVV-LVA (Most Valuable Victim - Least Valuable Attacker)
+            if (move == pvMove) score += 1000000
+
             val captured = engine.board[move.toRow][move.toCol]
             if (captured != XiangqiEngine.EMPTY) {
                 val attacker = engine.board[move.fromRow][move.fromCol]
                 score += (engine.getPieceValue(captured) * 10 - engine.getPieceValue(attacker)) * 100
             }
 
-            // Killer move bonus
             val moveKey = getMoveKey(move)
             score += (killerMoves[minOf(depth, MAX_DEPTH)][moveKey] ?: 0) * 50
-
-            // History heuristic
             score += (historyTable[moveKey] ?: 0)
 
-            // Best move from previous iteration
-            if (move == bestMoveAtRoot) score += 10000
-
-            // Position bonus for moving to good squares
             val piece = engine.board[move.fromRow][move.fromCol]
             score += getPositionBonus(piece, move.toRow, move.toCol)
 
             move to score
-        }.sortedByDescending { it.second }.map { it.first }
+        }.sortedByDescending { it.second }.map { it.first }.take(20)
+    }
+
+    private fun computeHash(engine: XiangqiEngine): Long {
+        var hash = 0L
+        for (r in 0 until XiangqiEngine.ROWS) {
+            for (c in 0 until XiangqiEngine.COLS) {
+                val piece = engine.board[r][c]
+                if (piece != XiangqiEngine.EMPTY) {
+                    hash = hash xor zobristTable[r][c][piece]
+                }
+            }
+        }
+        return hash
+    }
+
+    private fun updateHash(hash: Long, move: Move, piece: Int, captured: Int): Long {
+        var newHash = hash
+        newHash = newHash xor zobristTable[move.fromRow][move.fromCol][piece]
+        newHash = newHash xor zobristTable[move.toRow][move.toCol][piece]
+        if (captured != XiangqiEngine.EMPTY) {
+            newHash = newHash xor zobristTable[move.toRow][move.toCol][captured]
+        }
+        return newHash
     }
 
     private fun getMoveKey(move: Move): Int {
         return move.fromRow * 1000 + move.fromCol * 100 + move.toRow * 10 + move.toCol
     }
 
+    private fun countPieces(engine: XiangqiEngine): Int {
+        var count = 0
+        for (r in 0 until XiangqiEngine.ROWS) {
+            for (c in 0 until XiangqiEngine.COLS) {
+                if (engine.board[r][c] != XiangqiEngine.EMPTY) count++
+            }
+        }
+        return count
+    }
+
+    private fun countMaterial(engine: XiangqiEngine): Int {
+        var material = 0
+        for (r in 0 until XiangqiEngine.ROWS) {
+            for (c in 0 until XiangqiEngine.COLS) {
+                val piece = engine.board[r][c]
+                if (piece != XiangqiEngine.EMPTY) {
+                    material += PIECE_VALUES[piece] ?: 0
+                }
+            }
+        }
+        return material
+    }
+
     private fun evaluateBoard(engine: XiangqiEngine, forBlack: Boolean): Int {
         var score = 0
 
-        // Material and position
         for (r in 0 until XiangqiEngine.ROWS) {
             for (c in 0 until XiangqiEngine.COLS) {
                 val piece = engine.board[r][c]
@@ -339,16 +470,13 @@ class AIEngine {
             }
         }
 
-        // Mobility bonus
         val blackMoves = countMoves(engine, false)
         val redMoves = countMoves(engine, true)
         score += (blackMoves - redMoves) * 2
 
-        // King safety
-        if (engine.isInCheck(true)) score += 80  // Red in check
-        if (engine.isInCheck(false)) score -= 80 // Black in check
+        if (engine.isInCheck(true)) score += 80
+        if (engine.isInCheck(false)) score -= 80
 
-        // Rook on open file bonus
         score += evaluateRookFiles(engine)
 
         return if (forBlack) score else -score
@@ -396,7 +524,6 @@ class AIEngine {
                 if (piece != XiangqiEngine.EMPTY) piecesOnFile++
             }
 
-            // Open file bonus
             if (blackRook && piecesOnFile <= 3) score += 10
             if (redRook && piecesOnFile <= 3) score -= 10
         }
@@ -405,20 +532,13 @@ class AIEngine {
 
     private fun getPositionBonus(piece: Int, row: Int, col: Int): Int {
         return when (piece) {
-            XiangqiEngine.R_KING -> KING_POS[row][col]
-            XiangqiEngine.B_KING -> KING_POS[row][col]
-            XiangqiEngine.R_ADVISOR -> ADVISOR_POS[row][col]
-            XiangqiEngine.B_ADVISOR -> ADVISOR_POS[row][col]
-            XiangqiEngine.R_BISHOP -> BISHOP_POS[row][col]
-            XiangqiEngine.B_BISHOP -> BISHOP_POS[row][col]
-            XiangqiEngine.R_KNIGHT -> KNIGHT_POS[row][col]
-            XiangqiEngine.B_KNIGHT -> KNIGHT_POS[row][col]
-            XiangqiEngine.R_ROOK -> ROOK_POS[row][col]
-            XiangqiEngine.B_ROOK -> ROOK_POS[row][col]
-            XiangqiEngine.R_CANNON -> CANNON_POS[row][col]
-            XiangqiEngine.B_CANNON -> CANNON_POS[row][col]
-            XiangqiEngine.R_PAWN -> PAWN_POS[row][col]
-            XiangqiEngine.B_PAWN -> PAWN_POS[row][col]
+            XiangqiEngine.R_KING, XiangqiEngine.B_KING -> KING_POS[row][col]
+            XiangqiEngine.R_ADVISOR, XiangqiEngine.B_ADVISOR -> ADVISOR_POS[row][col]
+            XiangqiEngine.R_BISHOP, XiangqiEngine.B_BISHOP -> BISHOP_POS[row][col]
+            XiangqiEngine.R_KNIGHT, XiangqiEngine.B_KNIGHT -> KNIGHT_POS[row][col]
+            XiangqiEngine.R_ROOK, XiangqiEngine.B_ROOK -> ROOK_POS[row][col]
+            XiangqiEngine.R_CANNON, XiangqiEngine.B_CANNON -> CANNON_POS[row][col]
+            XiangqiEngine.R_PAWN, XiangqiEngine.B_PAWN -> PAWN_POS[row][col]
             else -> 0
         }
     }
